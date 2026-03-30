@@ -51,7 +51,14 @@ function addInterval(fn, ms) {
 function clearAllIntervals() {
   activeIntervals.forEach(clearInterval);
   activeIntervals = [];
-  if (behaviorTid) { clearTimeout(behaviorTid); behaviorTid = null; }
+  if (behaviorTid)  { clearTimeout(behaviorTid);  behaviorTid  = null; }
+  if (movementTid)  { clearTimeout(movementTid);  movementTid  = null; }
+  // Clear all movement control states safely
+  if (bot) {
+    ["forward","back","left","right","jump","sneak","sprint"].forEach(c => {
+      try { bot.setControlState(c, false); } catch(_) {}
+    });
+  }
 }
 
 // ── WEB DASHBOARD ─────────────────────────────────────────────────────────────
@@ -164,14 +171,14 @@ function scheduleReconnect() {
 //    (server kicks at 5 min — this gives a 60-second safety margin)
 //  • NCP-safe rules enforced per behavior (see comments below)
 //
+// Subtle variety behaviors — fired every 40-160s (lookAround, hotbar, arm, sneak, step)
+// Visible movement (walk/sprint/jump) is handled by movementLoop() which runs every 1.5-3.5s
 const BEHAVIORS = [
-  { name: "lookAround",   weight: 28 },  // most common — zero movement flags
-  { name: "microStep",    weight: 20 },  // pathfinder = valid physics, no SurvivalFly
-  { name: "sneakBrief",   weight: 15 },  // sneak + walk forward — visible crouch walk
-  { name: "hotbarSwitch", weight: 12 },  // slot switch — NCP doesn't flag this
-  { name: "swingArm",     weight:  9 },  // arm swing packet — totally safe
-  { name: "jumpOnce",     weight:  8 },  // jump while walking — looks natural
-  { name: "sprintBurst",  weight: 12 },  // short sprint burst — very human-like
+  { name: "lookAround",   weight: 30 },
+  { name: "microStep",    weight: 22 },
+  { name: "hotbarSwitch", weight: 20 },
+  { name: "swingArm",     weight: 16 },
+  { name: "sneakBrief",   weight: 12 },
 ];
 
 const MAX_IDLE_MS = 4 * 60 * 1000; // 4 min — kick is at 5 min
@@ -271,23 +278,6 @@ async function executeBehavior(name, defaultMove) {
         break;
       }
 
-      case "sprintBurst": {
-        // Short sprint in a random direction — NCP-safe: ≤2s, no jump during sprint
-        if (typeof bot.setControlState !== "function") break;
-        bot.pathfinder.setGoal(null);
-        const sprintYaw = Math.random() * Math.PI * 2;
-        await bot.look(sprintYaw, 0, true);
-        await new Promise(r => setTimeout(r, 300)); // settle before sprinting
-        bot.setControlState("sprint", true);
-        bot.setControlState("forward", true);
-        await new Promise(r => setTimeout(r, rand(800, 1800)));
-        if (bot) {
-          bot.setControlState("sprint", false);
-          bot.setControlState("forward", false);
-        }
-        addLog("[AntiAFK] Sprint burst");
-        break;
-      }
     }
 
     lastBehavior          = name;
@@ -295,6 +285,85 @@ async function executeBehavior(name, defaultMove) {
   } catch (e) {
     addLog(`[AntiAFK] Error in ${name}: ${e.message}`);
   }
+}
+
+
+// ── FAST MOVEMENT LOOP ────────────────────────────────────────────────────────
+//
+//  Runs every 1.5–3.5s — mirrors the old bot's visible movement but NCP-safe:
+//  • Clears all states first (no stacked inputs)
+//  • Jump only fires alone, never combined with sprint (SurvivalFly safe)
+//  • Sprint always paired with forward, pitch locked to 0 (no wild look+sprint)
+//  • 25% chance to rest (stand still) — humans pause too
+//  • movementTid stored so it clears cleanly on disconnect
+//
+let movementTid = null;
+
+function movementLoop() {
+  if (!bot || !botState.connected || !bot.entity) return;
+  try {
+    const CTRL = ["forward", "back", "left", "right", "jump", "sneak", "sprint"];
+    CTRL.forEach(c => { try { bot.setControlState(c, false); } catch(_){} });
+
+    const roll = Math.random();
+
+    if (roll < 0.25) {
+      // 25% — rest, just look around slightly
+      const yaw = Math.random() * Math.PI * 2;
+      bot.look(yaw, rand(-0.05, 0.05), false);
+      addLog("[Move] Idle");
+
+    } else if (roll < 0.45) {
+      // 20% — walk forward (normal pace)
+      const yaw = Math.random() * Math.PI * 2;
+      bot.look(yaw, 0, false);
+      bot.setControlState("forward", true);
+      addLog("[Move] Walk");
+
+    } else if (roll < 0.60) {
+      // 15% — sprint forward
+      const yaw = Math.random() * Math.PI * 2;
+      bot.look(yaw, 0, false);
+      bot.setControlState("forward", true);
+      bot.setControlState("sprint", true);
+      addLog("[Move] Sprint");
+
+    } else if (roll < 0.72) {
+      // 12% — strafe left or right
+      const dir = Math.random() < 0.5 ? "left" : "right";
+      const yaw = Math.random() * Math.PI * 2;
+      bot.look(yaw, 0, false);
+      bot.setControlState(dir, true);
+      addLog(`[Move] Strafe ${dir}`);
+
+    } else if (roll < 0.83) {
+      // 11% — sneak walk forward
+      const yaw = Math.random() * Math.PI * 2;
+      bot.look(yaw, 0, false);
+      bot.setControlState("sneak", true);
+      bot.setControlState("forward", true);
+      addLog("[Move] Sneak walk");
+
+    } else if (roll < 0.92) {
+      // 9% — jump (stationary) — safe: not combined with sprint
+      bot.setControlState("jump", true);
+      addLog("[Move] Jump");
+
+    } else {
+      // 8% — walk + jump (hop forward) — no sprint so NCP won't flag
+      const yaw = Math.random() * Math.PI * 2;
+      bot.look(yaw, 0, false);
+      bot.setControlState("forward", true);
+      bot.setControlState("jump", true);
+      addLog("[Move] Hop");
+    }
+
+    botState.lastActivity = Date.now();
+  } catch (e) {
+    addLog(`[Move] Error: ${e.message}`);
+  }
+
+  movementTid = setTimeout(movementLoop, rand(1500, 3500));
 }
 
 function scheduleNextBehavior(defaultMove) {
@@ -493,6 +562,7 @@ function createBot() {
           if (bot && botState.connected) {
             addLog("[AntiAFK] Human-like behavior engine active");
             scheduleNextBehavior(defaultMove);
+            movementLoop(); // fast movement loop — walk/sprint/jump/sneak every 1.5-3.5s
           }
         }, afkStart);
 
